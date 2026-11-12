@@ -1,0 +1,6 @@
+# Full HiRISE DTM downloads are large: never commit them.
+data/raw/
+
+# Python / pytest clutter
+__pycache__/
+.pytest_cache/
