@@ -1,5 +1,9 @@
 """Tests for terrain.py (requirement R3)."""
 
+import matplotlib
+
+matplotlib.use("Agg")                     # draw to files, never open a window
+
 import numpy as np
 import pytest
 import rasterio
@@ -7,7 +11,8 @@ from pyproj import CRS
 from rasterio.transform import from_origin
 from rasterio.windows import Window
 
-from terrain import compute_slope, crop_window, make_transformers, read_resampled
+from terrain import (Terrain, compute_slope, crop_window, load_terrain,
+                     make_transformers, plot_check, read_resampled)
 
 CELL = 2.0  # meters
 
@@ -238,3 +243,155 @@ def test_resample_partial_nodata_cell_uses_only_valid_pixels(tmp_path):
     assert np.all(np.isnan(elev[:, 0]))   # fully no-data cell
     assert np.allclose(elev[:, 1], 200.0) # half cell: only the valid pixels
     assert np.allclose(elev[:, 2], 100.0)
+
+
+# ---------- Terrain object ----------
+
+WINDOW = Window(100, 50, 400, 300)    # 400 m x 300 m of the fake DTM
+
+
+@pytest.fixture
+def terrain(dtm):
+    path, _ = dtm
+    with rasterio.open(path) as src:
+        elev, transform = read_resampled(src, WINDOW, CELL)
+        crs = src.crs
+    return Terrain(elev, compute_slope(elev, CELL), CELL, transform, crs)
+
+
+def test_terrain_holds_the_contract_fields(terrain):
+    assert terrain.elev.shape == (150, 200)
+    assert terrain.slope_deg.shape == terrain.elev.shape
+    assert terrain.cell_size == 2.0
+    assert terrain.transform.a == 2.0
+    assert terrain.crs is not None
+
+
+def test_lonlat_to_cell_finds_the_right_cell(dtm, terrain):
+    # 1 m pixel (col 200, row 150) is 100 px right and 100 px down from the
+    # window corner -> 2 m cell (row 50, col 50).
+    _, lonlat_of = dtm
+    assert terrain.lonlat_to_cell(*lonlat_of(200, 150)) == (50, 50)
+
+
+def test_rows_run_north_to_south(dtm, terrain):
+    _, lonlat_of = dtm
+    north = terrain.lonlat_to_cell(*lonlat_of(300, 60))
+    south = terrain.lonlat_to_cell(*lonlat_of(300, 300))
+    assert north[0] < south[0]                 # smaller row = further north
+
+
+def test_cell_to_lonlat_gives_the_cell_centre(terrain):
+    to_xy, _ = make_transformers(terrain.crs)
+    x, y = to_xy.transform(*terrain.cell_to_lonlat(0, 0))
+    corner_x, corner_y = terrain.transform.c, terrain.transform.f   # top-left corner
+    assert x == pytest.approx(corner_x + 1.0)  # 1 m east of the corner
+    assert y == pytest.approx(corner_y - 1.0)  # 1 m south of the corner
+
+
+def test_round_trip_within_half_a_cell_per_axis(dtm, terrain):
+    # R3: lon/lat -> cell -> lon/lat lands within 1 m in x AND within 1 m in y.
+    # (Not 1 m in a straight line: a corner point is 1.41 m from the centre.)
+    _, lonlat_of = dtm
+    to_xy, _ = make_transformers(terrain.crs)
+    rng = np.random.default_rng(0)
+    for col, row in rng.uniform([101, 51], [499, 349], size=(50, 2)):
+        lon, lat = lonlat_of(col, row)
+        lon2, lat2 = terrain.cell_to_lonlat(*terrain.lonlat_to_cell(lon, lat))
+        x, y = to_xy.transform(lon, lat)
+        x2, y2 = to_xy.transform(lon2, lat2)
+        assert abs(x2 - x) <= 1.0 and abs(y2 - y) <= 1.0
+
+
+def test_lonlat_to_cell_off_the_grid_raises(dtm, terrain):
+    _, lonlat_of = dtm
+    with pytest.raises(ValueError, match="outside the terrain grid"):
+        terrain.lonlat_to_cell(*lonlat_of(550, 200))   # in the file, not the crop
+
+
+def test_cells_are_plain_ints(dtm, terrain):
+    _, lonlat_of = dtm
+    row, col = terrain.lonlat_to_cell(*lonlat_of(200, 150))
+    assert type(row) is int and type(col) is int   # safe to use as indices
+
+
+# ---------- load_terrain (the one call main.py makes) ----------
+
+def test_load_terrain_end_to_end(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(200, 150), lonlat_of(400, 250)   # ~224 m apart
+    t = load_terrain(path, start, end)
+
+    assert isinstance(t, Terrain)
+    assert t.cell_size == 2.0
+    # R3: both input points land inside the cropped grid
+    for lon, lat in (start, end):
+        row, col = t.lonlat_to_cell(lon, lat)
+        assert np.isfinite(t.elev[row, col])
+    # cropped (300 m x 400 m area + margin), not the whole 400 x 600 m file
+    assert t.elev.shape[0] < DTM_H // 2 and t.elev.shape[1] < DTM_W // 2
+    # fake DTM is a 0.1 m/m ramp -> 5.71 deg wherever slope is defined
+    finite = np.isfinite(t.slope_deg)
+    assert np.allclose(t.slope_deg[finite], 5.71, atol=0.1)
+
+
+def test_load_terrain_margin_is_adjustable(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(250, 200), lonlat_of(350, 200)
+    small = load_terrain(path, start, end, margin_m=20.0)
+    big = load_terrain(path, start, end, margin_m=100.0)
+    assert small.elev.size < big.elev.size
+
+
+def test_load_terrain_off_dtm_point_raises(dtm):
+    path, lonlat_of = dtm
+    with pytest.raises(ValueError, match="outside the DTM"):
+        load_terrain(path, lonlat_of(200, 150), lonlat_of(900, 150))
+
+
+def test_load_terrain_closes_the_file(dtm):
+    # The DTM must not stay open (on Windows an open file can't be moved/deleted).
+    path, lonlat_of = dtm
+    load_terrain(path, lonlat_of(200, 150), lonlat_of(400, 250))
+    path.rename(path.with_suffix(".moved.tif"))             # fails if still open
+
+
+# ---------- plot_check (R3 visual check) ----------
+
+def _marker(ax, label):
+    """The (x, y) of the plotted marker with this legend label."""
+    (line,) = [ln for ln in ax.get_lines() if ln.get_label() == label]
+    return line.get_xdata()[0], line.get_ydata()[0]
+
+
+def test_plot_check_marks_both_points_in_the_right_place(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(200, 150), lonlat_of(400, 250)
+    t = load_terrain(path, start, end)
+    fig, ax = plot_check(t, start, end)
+
+    # Axes are meters east / north of the grid's bottom-left corner.
+    n_rows, n_cols = t.elev.shape
+    height_m = n_rows * t.cell_size
+    for label, (lon, lat) in (("Start", start), ("End", end)):
+        x, y = make_transformers(t.crs)[0].transform(lon, lat)
+        col_f, row_f = ~t.transform @ (x, y)
+        expected = (col_f * t.cell_size, height_m - row_f * t.cell_size)
+        assert _marker(ax, label) == pytest.approx(expected)
+
+    # Start is 200 m west and 100 m north of End.
+    sx, sy = _marker(ax, "Start")
+    ex, ey = _marker(ax, "End")
+    assert ex - sx == pytest.approx(200.0) and sy - ey == pytest.approx(100.0)
+    matplotlib.pyplot.close(fig)
+
+
+def test_plot_check_saves_a_png_even_with_nodata(dtm, tmp_path):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(80, 150), lonlat_of(250, 200)   # crop includes the no-data collar
+    t = load_terrain(path, start, end)
+    assert np.isnan(t.elev).any()
+    out = tmp_path / "check.png"
+    fig, _ = plot_check(t, start, end, out_path=out)
+    assert out.exists() and out.stat().st_size > 10_000
+    matplotlib.pyplot.close(fig)
