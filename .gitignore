@@ -1,0 +1,6 @@
+# big or regenerated files -- share the crops, not the full DTM
+data/dtm/
+data/cache/
+__pycache__/
+*.pyc
+.venv/
