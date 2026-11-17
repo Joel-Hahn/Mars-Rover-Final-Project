@@ -1,5 +1,7 @@
 """Tests for terrain.py (requirement R3)."""
 
+import math
+
 import matplotlib
 
 matplotlib.use("Agg")                     # draw to files, never open a window
@@ -7,9 +9,10 @@ matplotlib.use("Agg")                     # draw to files, never open a window
 import numpy as np
 import pytest
 import rasterio
-from pyproj import CRS
+from pyproj import CRS, Proj
 from rasterio.transform import from_origin
 from rasterio.windows import Window
+from rasterio.windows import bounds as window_bounds
 
 from terrain import (Terrain, compute_slope, crop_window, load_terrain,
                      make_transformers, plot_check, read_resampled)
@@ -34,6 +37,7 @@ MARS_EQC = CRS.from_wkt(
 
 def test_plane_rising_east_is_5_71_degrees():
     # z = 0.1 * x, with x = column index * 2 m.  Slope = atan(0.1) = 5.71 deg.
+    # Hand-derived by Shai: arctan(0.1) in degree mode = 5.71 deg.
     x = np.arange(10) * CELL
     elev = np.tile(0.1 * x, (8, 1))          # 8 identical rows
     slope = compute_slope(elev, CELL)
@@ -80,6 +84,8 @@ def test_projection_centre_maps_to_origin():
 
 def test_one_degree_east_uses_mars_radius_not_earth():
     # 1 deg of arc on Mars = 2*pi*R/360 = 59,274.7 m  (Earth would be 111,319 m)
+    # Hand-derived by Shai: 2*pi*3,396,190/360 = 59,274.698 m. (Mars's MEAN
+    # radius, 3,389,500 m, gives 59,157.9 m -- the radius must come from the file.)
     to_xy, _ = make_transformers(MARS_EQC)
     x, _ = to_xy.transform(78.4, 0.0)
     assert abs(x - 2 * np.pi * MARS_RADIUS / 360) < 0.01
@@ -177,11 +183,20 @@ def test_point_on_nodata_raises_clear_error(dtm):
 
 
 # ---------- read_resampled ----------
+# These tests draw the new grid on the FILE's own map (dst_crs = src.crs), so
+# the 2 m cells line up exactly with pairs of 1 m pixels and the expected
+# values can be worked out by hand. The local-map case is tested further down.
+
+def _read_same_map(src, window):
+    """read_resampled onto the file's own map, covering exactly `window`."""
+    return read_resampled(src, window, src.crs,
+                          window_bounds(window, src.transform), CELL)
+
 
 def test_resample_gives_2m_cells_and_right_shape(dtm):
     path, _ = dtm
     with rasterio.open(path) as src:
-        elev, transform = read_resampled(src, Window(100, 50, 200, 100), CELL)
+        elev, transform = _read_same_map(src, Window(100, 50, 200, 100))
     assert elev.shape == (50, 100)               # 100 m x 200 m at 2 m/cell
     assert transform.a == 2.0 and transform.e == -2.0   # +2 m east, 2 m south per cell
     assert elev.dtype == np.float64
@@ -190,39 +205,40 @@ def test_resample_gives_2m_cells_and_right_shape(dtm):
 def test_resample_averages_the_1m_pixels(dtm):
     # Fake DTM: pixel in column c has z = -2500 + 0.1*c.
     # 2 m cell j (inside the window) averages columns 100+2j and 101+2j.
+    # Hand-derived by Shai for j=0: (-2490 + -2489.9) / 2 = -2489.95 m.
     path, _ = dtm
     with rasterio.open(path) as src:
-        elev, _ = read_resampled(src, Window(100, 50, 200, 100), CELL)
+        elev, _ = _read_same_map(src, Window(100, 50, 200, 100))
     j = np.arange(100)
     expected = -2500.0 + 0.1 * (100 + 2 * j + 0.5)
     assert np.allclose(elev[0], expected, atol=1e-3)
-    # ...and the slope module agrees: 0.1 m per m -> 5.71 deg
+    # ...and the slope module agrees: 0.1 m per MAP m -> 5.71 deg on this map
     assert np.allclose(compute_slope(elev, CELL)[1:-1, 1:-1], 5.71, atol=0.1)
 
 
 def test_resample_turns_nodata_into_nan(dtm):
     path, _ = dtm
     with rasterio.open(path) as src:
-        elev, _ = read_resampled(src, Window(0, 0, 200, 100), CELL)
+        elev, _ = _read_same_map(src, Window(0, 0, 200, 100))
     collar_cells = COLLAR // 2                   # 50 px of no-data = 25 cells
     assert np.all(np.isnan(elev[:, :collar_cells]))
     assert np.all(np.isfinite(elev[:, collar_cells:]))
     assert np.nanmin(elev) > -3000               # no -3.4e38 left anywhere
 
 
-def test_resample_keeps_exact_2m_for_odd_windows(dtm):
+def test_resample_grid_covers_odd_sized_bounds(dtm):
     path, _ = dtm
     with rasterio.open(path) as src:
-        elev, transform = read_resampled(src, Window(100, 50, 201, 101), CELL)
-    assert transform.a == 2.0 and transform.e == -2.0
-    assert elev.shape == (50, 100)               # the odd last metre is dropped
+        elev, transform = _read_same_map(src, Window(100, 50, 201, 101))
+    assert transform.a == 2.0 and transform.e == -2.0   # cells stay exactly 2 m
+    assert elev.shape == (51, 101)               # 101 m x 201 m -> round UP
 
 
 def test_resample_transform_is_georeferenced(dtm):
     # The new transform must put cell (0, 0) where the window really is.
     path, _ = dtm
     with rasterio.open(path) as src:
-        _, transform = read_resampled(src, Window(100, 50, 200, 100), CELL)
+        _, transform = _read_same_map(src, Window(100, 50, 200, 100))
         window_corner = src.transform @ (100, 50)    # top-left of the window
     assert transform @ (0, 0) == pytest.approx(window_corner)
 
@@ -239,7 +255,7 @@ def test_resample_partial_nodata_cell_uses_only_valid_pixels(tmp_path):
                        transform=from_origin(0, 4, 1, 1), nodata=HIRISE_NODATA) as dst:
         dst.write(elev_1m, 1)
     with rasterio.open(path) as src:
-        elev, _ = read_resampled(src, Window(0, 0, 6, 4), CELL)
+        elev, _ = _read_same_map(src, Window(0, 0, 6, 4))
     assert np.all(np.isnan(elev[:, 0]))   # fully no-data cell
     assert np.allclose(elev[:, 1], 200.0) # half cell: only the valid pixels
     assert np.allclose(elev[:, 2], 100.0)
@@ -254,7 +270,7 @@ WINDOW = Window(100, 50, 400, 300)    # 400 m x 300 m of the fake DTM
 def terrain(dtm):
     path, _ = dtm
     with rasterio.open(path) as src:
-        elev, transform = read_resampled(src, WINDOW, CELL)
+        elev, transform = _read_same_map(src, WINDOW)
         crs = src.crs
     return Terrain(elev, compute_slope(elev, CELL), CELL, transform, crs)
 
@@ -270,6 +286,7 @@ def test_terrain_holds_the_contract_fields(terrain):
 def test_lonlat_to_cell_finds_the_right_cell(dtm, terrain):
     # 1 m pixel (col 200, row 150) is 100 px right and 100 px down from the
     # window corner -> 2 m cell (row 50, col 50).
+    # Hand-derived by Shai: (150-50)/2 = 50, (200-100)/2 = 50.
     _, lonlat_of = dtm
     assert terrain.lonlat_to_cell(*lonlat_of(200, 150)) == (50, 50)
 
@@ -292,6 +309,7 @@ def test_cell_to_lonlat_gives_the_cell_centre(terrain):
 def test_round_trip_within_half_a_cell_per_axis(dtm, terrain):
     # R3: lon/lat -> cell -> lon/lat lands within 1 m in x AND within 1 m in y.
     # (Not 1 m in a straight line: a corner point is 1.41 m from the centre.)
+    # Hand-derived by Shai: sqrt(1^2 + 1^2) = sqrt(2) = 1.41 m.
     _, lonlat_of = dtm
     to_xy, _ = make_transformers(terrain.crs)
     rng = np.random.default_rng(0)
@@ -330,9 +348,8 @@ def test_load_terrain_end_to_end(dtm):
         assert np.isfinite(t.elev[row, col])
     # cropped (300 m x 400 m area + margin), not the whole 400 x 600 m file
     assert t.elev.shape[0] < DTM_H // 2 and t.elev.shape[1] < DTM_W // 2
-    # fake DTM is a 0.1 m/m ramp -> 5.71 deg wherever slope is defined
-    finite = np.isfinite(t.slope_deg)
-    assert np.allclose(t.slope_deg[finite], 5.71, atol=0.1)
+    # The ground slope (6.02 deg here) is checked in the true-scale tests below.
+    assert np.isfinite(t.slope_deg).any()
 
 
 def test_load_terrain_margin_is_adjustable(dtm):
@@ -379,10 +396,13 @@ def test_plot_check_marks_both_points_in_the_right_place(dtm):
         expected = (col_f * t.cell_size, height_m - row_f * t.cell_size)
         assert _marker(ax, label) == pytest.approx(expected)
 
-    # Start is 200 m west and 100 m north of End.
+    # Start is 200 MAP m west and 100 m north of End. On the ground the
+    # east-west gap shrinks by cos(latitude): 200 * cos(18.44 deg) = 189.7 m.
+    mid_lat = (start[1] + end[1]) / 2
     sx, sy = _marker(ax, "Start")
     ex, ey = _marker(ax, "End")
-    assert ex - sx == pytest.approx(200.0) and sy - ey == pytest.approx(100.0)
+    assert ex - sx == pytest.approx(200.0 * math.cos(math.radians(mid_lat)))
+    assert sy - ey == pytest.approx(100.0)
     matplotlib.pyplot.close(fig)
 
 
@@ -395,3 +415,32 @@ def test_plot_check_saves_a_png_even_with_nodata(dtm, tmp_path):
     fig, _ = plot_check(t, start, end, out_path=out)
     assert out.exists() and out.stat().st_size > 10_000
     matplotlib.pyplot.close(fig)
+
+
+# ---------- true ground scale (the east-west stretch fix) ----------
+# The source map (lat_ts = 0) stretches east-west by 1/cos(latitude). At
+# Jezero (18.44 N) one "map meter" east-west is only 0.949 m on the ground.
+
+def test_load_terrain_slope_is_the_true_ground_slope(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(200, 150), lonlat_of(400, 250)
+    lat = (start[1] + end[1]) / 2
+    t = load_terrain(path, start, end)
+    # Ramp rises 0.1 m per MAP meter east = 0.1/cos(lat) per GROUND meter.
+    expected = math.degrees(math.atan(0.1 / math.cos(math.radians(lat))))  # 6.02
+    finite = np.isfinite(t.slope_deg)
+    # R3's tolerance (0.1 deg). The stretched 0.95 m pixels don't divide 2 m
+    # cells evenly, which leaves a ripple of a few hundredths of a degree.
+    assert np.allclose(t.slope_deg[finite], expected, atol=0.1)
+    # The old, unfixed answer (5.71) must be clearly rejected.
+    assert np.median(t.slope_deg[finite]) > 5.9
+
+
+def test_load_terrain_cells_are_true_2m_on_the_ground(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(200, 150), lonlat_of(400, 250)
+    t = load_terrain(path, start, end)
+    mid_lon, mid_lat = (start[0] + end[0]) / 2, (start[1] + end[1]) / 2
+    f = Proj(t.crs).get_factors(mid_lon, mid_lat)
+    assert f.parallel_scale == pytest.approx(1.0, abs=1e-6)     # east-west
+    assert f.meridional_scale == pytest.approx(1.0, abs=1e-6)   # north-south

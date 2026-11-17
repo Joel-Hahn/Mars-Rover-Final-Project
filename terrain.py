@@ -9,8 +9,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import rasterio
 from affine import Affine
-from pyproj import CRS, Transformer
+from pyproj import CRS, Proj, Transformer
+from pyproj.crs import ProjectedCRS
+from pyproj.crs.coordinate_operation import EquidistantCylindricalConversion
+from rasterio.crs import CRS as RioCRS
 from rasterio.enums import Resampling
+from rasterio.transform import from_origin
+from rasterio.warp import reproject
 from rasterio.windows import Window
 
 
@@ -53,6 +58,24 @@ def make_transformers(crs):
     lonlat_to_xy = Transformer.from_crs(geodetic, crs, always_xy=True)
     xy_to_lonlat = Transformer.from_crs(crs, geodetic, always_xy=True)
     return lonlat_to_xy, xy_to_lonlat
+
+
+def make_local_crs(crs, lon, lat):
+    """Return a flat map of the same planet that is true to scale at (lon, lat).
+
+    The DTM's own map (equirectangular, true scale at the equator) stretches
+    east-west by 1/cos(latitude): about 5.4% at Jezero. This builds the same
+    kind of map but true to scale at the drive's own latitude, centred on it,
+    so 1 map meter = 1 ground meter in BOTH directions near the drive.
+    """
+    crs = CRS.from_user_input(crs)
+    conversion = EquidistantCylindricalConversion(
+        latitude_first_parallel=lat,        # true scale along THIS latitude
+        longitude_natural_origin=lon,       # x = 0 at the drive
+    )
+    # Same planet/datum as the file: reuse its geodetic CRS, never a new one.
+    return ProjectedCRS(conversion=conversion, geodetic_crs=crs.geodetic_crs,
+                        name="Local true-scale map at the drive")
 
 
 def crop_window(src, start, end, lonlat_to_xy, margin_m=100.0):
@@ -113,32 +136,42 @@ def _check_on_dtm(src, name, lonlat, x, y):
         )
 
 
-def read_resampled(src, window, cell_size=2.0):
-    """Read `window` of the DTM, averaged onto square cells of `cell_size` m.
+def read_resampled(src, window, dst_crs, dst_bounds, cell_size=2.0):
+    """Read `window` of the DTM and re-draw it as square cell_size-m cells.
+
+    src        : the open DTM
+    window     : the piece of the file to read (from crop_window)
+    dst_crs    : the map to draw the new grid on (from make_local_crs)
+    dst_bounds : (left, bottom, right, top) of the new grid, in dst_crs meters
+    cell_size  : side of each new cell in meters
 
     Returns (elev, transform):
       elev      : 2D float64 array in meters, NaN where the DTM has no data
-      transform : affine transform of the NEW grid (cell (0,0) = window corner)
+      transform : affine transform of the NEW grid, in dst_crs meters
     """
-    res_x, res_y = src.res                     # source pixel size in m (~1 for HiRISE)
+    # 1. Read only the cropped piece. masked=True marks no-data; turn it into
+    #    NaN so the fake -3.4e38 value never gets averaged into a cell.
+    data = src.read(1, window=window, masked=True)
+    data = data.astype(np.float64).filled(np.nan)
 
-    # How many whole 2 m cells fit in the window. A leftover strip narrower
-    # than one cell is dropped, so every cell is exactly cell_size wide.
-    n_cols = int(window.width * res_x // cell_size)
-    n_rows = int(window.height * res_y // cell_size)
-    window = Window(window.col_off, window.row_off,
-                    n_cols * cell_size / res_x, n_rows * cell_size / res_y)
+    # 2. The new, empty grid: enough whole cells to cover dst_bounds.
+    left, bottom, right, top = dst_bounds
+    n_cols = math.ceil((right - left) / cell_size)
+    n_rows = math.ceil((top - bottom) / cell_size)
+    transform = from_origin(left, top, cell_size, cell_size)   # top-left corner
+    elev = np.full((n_rows, n_cols), np.nan)
 
-    # Resampling.average: each 2 m cell = mean of the 1 m pixels under it
-    # (no-data pixels are left out of the mean). masked=True marks no-data.
-    data = src.read(1, window=window, out_shape=(n_rows, n_cols),
-                    resampling=Resampling.average, masked=True)
-    elev = data.astype(np.float64).filled(np.nan)
-
-    # Grid geometry: start at the window's top-left corner, then stretch the
-    # pixel size from res to cell_size.
-    transform = src.window_transform(window) @ Affine.scale(
-        cell_size / res_x, cell_size / res_y)
+    # 3. Re-draw: for each new cell, average the source pixels that fall
+    #    inside it (Resampling.average). NaN pixels are left out of the mean;
+    #    a cell with no valid pixels stays NaN.
+    reproject(
+        source=data, destination=elev,
+        src_transform=src.window_transform(window), src_crs=src.crs,
+        src_nodata=np.nan,
+        dst_transform=transform, dst_crs=RioCRS.from_wkt(CRS(dst_crs).to_wkt()),
+        dst_nodata=np.nan,
+        resampling=Resampling.average,
+    )
     return elev, transform
 
 
@@ -148,9 +181,10 @@ class Terrain:
 
     elev      : 2D float array, meters, NaN = no data
     slope_deg : 2D float array, same shape as elev
-    cell_size : meters per cell (2.0)
+    cell_size : meters per cell (2.0), true ground meters in both directions
     transform : affine transform of the grid: (col, row) -> map (x, y)
-    crs       : the DTM's projected CRS (Mars)
+    crs       : the local true-scale Mars map the grid is drawn on
+                (from make_local_crs), not the DTM file's own map
 
     Row 0 is the north edge; rows increase southward, columns eastward.
     """
@@ -198,19 +232,35 @@ def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0):
 
     Raises ValueError if either point is off the DTM or on no-data.
     """
+    mid_lon = (start[0] + end[0]) / 2
+    mid_lat = (start[1] + end[1]) / 2
+
     # 'with' closes the file again as soon as the block ends, even on an error.
     with rasterio.open(dtm_path) as src:
+        # The output grid lives on a local map that is true to scale at the
+        # drive, so every cell is cell_size x cell_size meters ON THE GROUND.
+        local_crs = make_local_crs(src.crs, mid_lon, mid_lat)
+        local_to_xy, _ = make_transformers(local_crs)
+        xs, ys = zip(*(local_to_xy.transform(lon, lat) for lon, lat in (start, end)))
+        dst_bounds = (min(xs) - margin_m, min(ys) - margin_m,
+                      max(xs) + margin_m, max(ys) + margin_m)
+
+        # Crop the file a little wider than the margin: the file's map is
+        # stretched (scale factor k > 1), and the edge cells need whole pixels.
+        k = Proj(CRS.from_user_input(src.crs)).get_factors(mid_lon, mid_lat)
+        stretch = max(k.parallel_scale, k.meridional_scale)
         to_xy, _ = make_transformers(src.crs)            # CRS read from the file
-        window = crop_window(src, start, end, to_xy, margin_m)
-        elev, transform = read_resampled(src, window, cell_size)
-        crs = src.crs
+        window = crop_window(src, start, end, to_xy,
+                             margin_m * stretch + 2 * cell_size)
+
+        elev, transform = read_resampled(src, window, local_crs, dst_bounds,
+                                         cell_size)
 
     terrain = Terrain(elev, compute_slope(elev, cell_size), cell_size,
-                      transform, crs)
+                      transform, local_crs)
 
-    # R3: both points must land inside the final grid. Resampling can drop a
-    # strip under one cell wide at the far edge; this catches that rare case
-    # with a clear message (lonlat_to_cell raises ValueError).
+    # R3: both points must land inside the final grid (they always should,
+    # since the grid is built around them; this fails loudly if not).
     terrain.lonlat_to_cell(*start)
     terrain.lonlat_to_cell(*end)
     return terrain
