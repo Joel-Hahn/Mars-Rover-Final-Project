@@ -14,7 +14,8 @@ from rasterio.transform import from_origin
 from rasterio.windows import Window
 from rasterio.windows import bounds as window_bounds
 
-from terrain import (Terrain, compute_slope, crop_window, load_terrain,
+from terrain import (Terrain, case_dtm_path, compute_slope, crop_window,
+                     load_case, load_terrain,
                      make_transformers, plot_check, read_resampled)
 
 CELL = 2.0  # meters
@@ -444,3 +445,59 @@ def test_load_terrain_cells_are_true_2m_on_the_ground(dtm):
     f = Proj(t.crs).get_factors(mid_lon, mid_lat)
     assert f.parallel_scale == pytest.approx(1.0, abs=1e-6)     # east-west
     assert f.meridional_scale == pytest.approx(1.0, abs=1e-6)   # north-south
+
+
+# ---------- connecting to cases.py / fetch.py ----------
+
+def _fake_case(lonlat_of, route_px=((200, 150), (300, 120), (400, 250))):
+    """A case dict shaped exactly like one entry of cases.py's cases.json."""
+    (sc, sr), (ec, er) = route_px[0], route_px[-1]
+    s_lon, s_lat = lonlat_of(sc, sr)
+    e_lon, e_lat = lonlat_of(ec, er)
+    return {
+        "id": "case1",
+        "start": {"idx": 10, "lon": s_lon, "lat": s_lat, "sol": 100},
+        "end": {"idx": 12, "lon": e_lon, "lat": e_lat, "sol": 103},
+        "straight_m": 210.0, "nasa_path_m": 260.0,
+        "nasa_route_lonlat": [list(lonlat_of(c, r)) for c, r in route_px],
+    }
+
+
+def test_load_case_uses_the_case_start_and_end(dtm):
+    path, lonlat_of = dtm
+    case = _fake_case(lonlat_of)
+    t = load_case(case, dtm_path=path)
+    assert isinstance(t, Terrain)
+    for key in ("start", "end"):
+        row, col = t.lonlat_to_cell(case[key]["lon"], case[key]["lat"])
+        assert np.isfinite(t.elev[row, col])
+
+
+def test_load_case_grid_covers_the_whole_nasa_route(dtm):
+    # NASA's route bulges 220 m north of the start (row 150 -> row -70 is off
+    # the file, so use row 10): well outside a 50 m margin around the endpoints.
+    path, lonlat_of = dtm
+    case = _fake_case(lonlat_of, route_px=((200, 250), (300, 10), (400, 260)))
+    t = load_case(case, dtm_path=path, margin_m=50.0)
+    for lon, lat in case["nasa_route_lonlat"]:
+        t.lonlat_to_cell(lon, lat)               # raises if off the grid
+
+
+def test_load_terrain_include_widens_the_grid(dtm):
+    path, lonlat_of = dtm
+    start, end = lonlat_of(250, 200), lonlat_of(350, 200)
+    plain = load_terrain(path, start, end, margin_m=20.0)
+    wider = load_terrain(path, start, end, margin_m=20.0,
+                         include=[lonlat_of(300, 30)])   # 170 m north
+    assert wider.elev.shape[0] > plain.elev.shape[0] + 70
+    wider.lonlat_to_cell(*lonlat_of(300, 30))
+
+
+def test_case_dtm_path_prefers_the_per_case_crop(tmp_path, monkeypatch):
+    import crop_dtm
+    import fetch
+    monkeypatch.setattr(crop_dtm, "OUT", tmp_path)
+    case = {"id": "case7"}
+    assert case_dtm_path(case) == fetch.dtm_source()       # no crop yet
+    (tmp_path / "case7.tif").write_bytes(b"")              # Sam's crop exists
+    assert case_dtm_path(case) == str(tmp_path / "case7.tif")

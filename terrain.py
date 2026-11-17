@@ -78,15 +78,17 @@ def make_local_crs(crs, lon, lat):
                         name="Local true-scale map at the drive")
 
 
-def crop_window(src, start, end, lonlat_to_xy, margin_m=100.0):
+def crop_window(src, start, end, lonlat_to_xy, margin_m=100.0, extra=()):
     """Return the rasterio Window covering start, end and a margin around them.
 
     src          : an open rasterio dataset (the DTM)
     start, end   : (lon, lat) in degrees, east-positive
     lonlat_to_xy : transformer from make_transformers(src.crs)
     margin_m     : extra ground (meters) on every side, so routes can detour
+    extra        : more (lon, lat) points the crop must also cover, e.g.
+                   NASA's route (not checked for data, only included)
 
-    Raises ValueError if either point is outside the file or on no-data.
+    Raises ValueError if start or end is outside the file or on no-data.
     """
     # 1. Both points into map meters (x east, y north).
     points_xy = [lonlat_to_xy.transform(lon, lat) for lon, lat in (start, end)]
@@ -95,7 +97,8 @@ def crop_window(src, start, end, lonlat_to_xy, margin_m=100.0):
     for name, lonlat, (x, y) in zip(("start", "end"), (start, end), points_xy):
         _check_on_dtm(src, name, lonlat, x, y)
 
-    # 3. Bounding box of the two points, grown by the margin (in meters).
+    # 3. Bounding box of all the points, grown by the margin (in meters).
+    points_xy += [lonlat_to_xy.transform(lon, lat) for lon, lat in extra]
     xs = [p[0] for p in points_xy]
     ys = [p[1] for p in points_xy]
     left, right = min(xs) - margin_m, max(xs) + margin_m
@@ -221,17 +224,21 @@ class Terrain:
         return self._to_lonlat.transform(x, y)
 
 
-def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0):
+def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0,
+                 include=()):
     """Build the Terrain for one test drive. This is what main.py calls.
 
-    dtm_path : path to the HiRISE DTM GeoTIFF
+    dtm_path : path to the HiRISE DTM GeoTIFF (or fetch.dtm_source())
     start    : (lon, lat) in degrees, east-positive, from cases.py
     end      : (lon, lat) in degrees, east-positive, from cases.py
-    margin_m : extra ground around the two points (meters)
+    margin_m : extra ground around the points (meters)
     cell_size: output cell size in meters (2.0 by contract)
+    include  : more (lon, lat) points the grid must cover, e.g. NASA's route,
+               so plots.py can draw it on the same grid
 
-    Raises ValueError if either point is off the DTM or on no-data.
+    Raises ValueError if start or end is off the DTM or on no-data.
     """
+    include = [tuple(p[:2]) for p in include]
     mid_lon = (start[0] + end[0]) / 2
     mid_lat = (start[1] + end[1]) / 2
 
@@ -241,7 +248,8 @@ def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0):
         # drive, so every cell is cell_size x cell_size meters ON THE GROUND.
         local_crs = make_local_crs(src.crs, mid_lon, mid_lat)
         local_to_xy, _ = make_transformers(local_crs)
-        xs, ys = zip(*(local_to_xy.transform(lon, lat) for lon, lat in (start, end)))
+        xs, ys = zip(*(local_to_xy.transform(lon, lat)
+                       for lon, lat in [start, end, *include]))
         dst_bounds = (min(xs) - margin_m, min(ys) - margin_m,
                       max(xs) + margin_m, max(ys) + margin_m)
 
@@ -251,7 +259,7 @@ def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0):
         stretch = max(k.parallel_scale, k.meridional_scale)
         to_xy, _ = make_transformers(src.crs)            # CRS read from the file
         window = crop_window(src, start, end, to_xy,
-                             margin_m * stretch + 2 * cell_size)
+                             margin_m * stretch + 2 * cell_size, extra=include)
 
         elev, transform = read_resampled(src, window, local_crs, dst_bounds,
                                          cell_size)
@@ -264,6 +272,35 @@ def load_terrain(dtm_path, start, end, margin_m=100.0, cell_size=2.0):
     terrain.lonlat_to_cell(*start)
     terrain.lonlat_to_cell(*end)
     return terrain
+
+
+# ---------- connecting to fetch.py / cases.py ----------
+
+def case_dtm_path(case):
+    """Which DTM file to open for one case from cases.json.
+
+    Prefers the small per-case crop that crop_dtm.py writes (fast, works
+    offline); otherwise fetch.dtm_source(): the full DTM on disk, or the
+    USGS file read over the internet.
+    """
+    import crop_dtm                      # imported here so terrain.py and its
+    import fetch                         # tests don't need the network code
+
+    crop = crop_dtm.OUT / f"{case['id']}.tif"
+    return str(crop) if crop.exists() else fetch.dtm_source()
+
+
+def load_case(case, dtm_path=None, margin_m=100.0, cell_size=2.0):
+    """Build the Terrain for one case dict from cases.py's cases.json.
+
+    Uses the case's start/end lon/lat, and makes the grid also cover NASA's
+    actual route (nasa_route_lonlat) so it can be drawn on the same map.
+    """
+    start = (case["start"]["lon"], case["start"]["lat"])
+    end = (case["end"]["lon"], case["end"]["lat"])
+    route = case.get("nasa_route_lonlat", [])
+    return load_terrain(dtm_path or case_dtm_path(case), start, end,
+                        margin_m, cell_size, include=route)
 
 
 # ---------- visual check (R3) ----------
@@ -349,23 +386,42 @@ def plot_check(terrain, start, end, out_path=None, title=None):
 
 
 if __name__ == "__main__":
-    # Quick check on a real DTM, e.g.
-    #   py terrain.py data/raw/DTM.tif 77.45 18.44 77.452 18.441 --out check.png
+    # Quick check on a real DTM. Either a case from cases.py's cases.json:
+    #   py terrain.py --case case1
+    # or any DTM and two points:
+    #   py terrain.py data/dtm/DTM.tif 77.45 18.44 77.452 18.441 --out check.png
     import argparse
+    import json
 
     parser = argparse.ArgumentParser(description="Load and plot a terrain grid.")
-    parser.add_argument("dtm")
-    parser.add_argument("start_lon", type=float)
-    parser.add_argument("start_lat", type=float)
-    parser.add_argument("end_lon", type=float)
-    parser.add_argument("end_lat", type=float)
+    parser.add_argument("--case", help="case id from data/cases.json, e.g. case1")
+    parser.add_argument("dtm", nargs="?")
+    parser.add_argument("coords", nargs="*", type=float,
+                        help="start_lon start_lat end_lon end_lat")
     parser.add_argument("--margin", type=float, default=100.0, help="meters")
     parser.add_argument("--out", default="terrain_check.png")
     args = parser.parse_args()
 
-    start = (args.start_lon, args.start_lat)
-    end = (args.end_lon, args.end_lat)
-    t = load_terrain(args.dtm, start, end, margin_m=args.margin)
+    if args.case:
+        import cases                                       # Sam's module
+        if not cases.CASES_FILE.exists():
+            parser.error(f"{cases.CASES_FILE} not found. Run `py cases.py` "
+                         f"(or `py run_data.py`) first.")
+        all_cases = json.loads(cases.CASES_FILE.read_text())
+        case = next((c for c in all_cases if c["id"] == args.case), None)
+        if case is None:
+            parser.error(f"no {args.case!r} in {cases.CASES_FILE}; have "
+                         f"{[c['id'] for c in all_cases]}")
+        start = (case["start"]["lon"], case["start"]["lat"])
+        end = (case["end"]["lon"], case["end"]["lat"])
+        print(f"{args.case}: sols {case['start']['sol']} -> {case['end']['sol']}, "
+              f"{case['straight_m']} m apart; DTM: {args.dtm or case_dtm_path(case)}")
+        t = load_case(case, dtm_path=args.dtm, margin_m=args.margin)
+    elif args.dtm and len(args.coords) == 4:
+        start, end = tuple(args.coords[:2]), tuple(args.coords[2:])
+        t = load_terrain(args.dtm, start, end, margin_m=args.margin)
+    else:
+        parser.error("give --case ID, or a DTM path and 4 coordinates")
     finite = np.isfinite(t.slope_deg)
     print(f"Grid {t.elev.shape[0]} x {t.elev.shape[1]} cells at {t.cell_size:g} m")
     print(f"Elevation {np.nanmin(t.elev):.1f} to {np.nanmax(t.elev):.1f} m; "
