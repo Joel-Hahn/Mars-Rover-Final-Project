@@ -94,6 +94,8 @@ class RouteDisplay:
     note: str
     ascent_m: float | None = None
     descent_m: float | None = None
+    # Per-step costs (traversability MoveResult) for plots.py's graphs.
+    moves: tuple = ()
 
     @property
     def energy_wh(self) -> float | None:
@@ -238,16 +240,22 @@ def route_cells_near_recorded_line(terrain, xy_line: Sequence[XY]) -> list[tuple
     return out
 
 
-def evaluate_recorded_path(model, terrain, xy_line: Sequence[XY]) -> tuple[float | None, float | None, str]:
-    """Model time and energy along NASA geometry; unavailable if blocked."""
+def evaluate_recorded_path(model, terrain, xy_line: Sequence[XY]
+                           ) -> tuple[float | None, float | None, str, tuple]:
+    """Model time and energy along NASA geometry; unavailable if blocked.
+
+    Also returns the per-step moves (empty if unavailable) for plots.py.
+    """
     try:
         cells = route_cells_near_recorded_line(terrain, xy_line)
         result = model.evaluate_path(cells)
         if not result.passable:
-            return None, None, "Model rejects at least one recorded-track tile/transition; estimates unavailable."
-        return result.time_s, result.energy_j, "Modeled from NASA track snapped to 2 m cells (NOT measured)."
+            return (None, None, "Model rejects at least one recorded-track tile/transition; "
+                    "estimates unavailable.", ())
+        return (result.time_s, result.energy_j,
+                "Modeled from NASA track snapped to 2 m cells (NOT measured).", result.moves)
     except (ValueError, IndexError) as exc:
-        return None, None, f"Model estimate unavailable: {exc}"
+        return None, None, f"Model estimate unavailable: {exc}", ()
 
 
 def cell_xy(terrain, cells: Sequence[tuple[int, int]]) -> tuple[XY, ...]:
@@ -288,12 +296,12 @@ def calculate_real_routes(terrain, track_xy: Sequence[XY], start: RoverPoint,
     model = TraversabilityModel(terrain)
     actual = recorded_subpath(track_xy, start.along_m, end.along_m)
     recorded_length = cumulative_distances(actual)[-1]
-    t, e, actual_note = evaluate_recorded_path(model, terrain, actual)
+    t, e, actual_note, actual_moves = evaluate_recorded_path(model, terrain, actual)
     if start.along_m > end.along_m:
         actual_note = "Reverse of NASA recorded chronology. " + actual_note
     result = {
         ACTUAL: RouteDisplay(ACTUAL, tuple(actual), recorded_length, t, e,
-                             actual_note)
+                             actual_note, moves=tuple(actual_moves))
     }
 
     def not_found(name: str, reason: str) -> RouteDisplay:
@@ -316,7 +324,7 @@ def calculate_real_routes(terrain, track_xy: Sequence[XY], start: RoverPoint,
                 name, cell_xy(terrain, route.cells), route.distance_m,
                 route.time_s, route.energy_j,
                 "A* on 2 m tiles; no charging. " + snap_note,
-                route.ascent_m, route.descent_m,
+                route.ascent_m, route.descent_m, moves=route.moves,
             )
         else:
             result[name] = not_found(name, route.reason)
@@ -487,6 +495,9 @@ class MarsRoverUI(ttk.Frame):
         self.calculate_button = ttk.Button(side, text="Calculate and compare routes",
                                             command=self.calculate_paths)
         self.calculate_button.pack(fill="x", pady=(0, 7))
+        self.graphs_button = ttk.Button(side, text="Show energy & distance graphs",
+                                        command=self.show_graphs, state="disabled")
+        self.graphs_button.pack(fill="x", pady=(0, 7))
         ttk.Button(side, text="Clear selection", command=self.clear_selection).pack(fill="x", pady=(0, 10))
 
         ttk.Separator(side).pack(fill="x", pady=(0, 9))
@@ -684,6 +695,20 @@ class MarsRoverUI(ttk.Frame):
         valid, _ = self._valid_selection()
         self.calculate_button.configure(state="normal" if valid and self.terrain is not None
                                         and not self.loading and not self.calculating else "disabled")
+        # Graphs need finished routes with per-step data.
+        has_steps = any(r.moves for r in self.routes.values())
+        self.graphs_button.configure(state="normal" if has_steps and not self.calculating
+                                     else "disabled")
+
+    def show_graphs(self) -> None:
+        """Open plots.py's energy/distance-over-time graphs for the current routes."""
+        import plots
+
+        profiles = [plots.route_profile(name, self.routes[name].moves, self.routes[name].note)
+                    for name in ROUTE_NAMES if name in self.routes]
+        case_id = (self.case or {}).get("id", "")
+        plots.open_plot_window(self.parent, profiles, ROUTE_STYLES,
+                               title=f"Energy and distance over time  {case_id}".strip())
 
     def _selection_changed(self, _event=None) -> None:
         self._generation += 1 if self.calculating else 0
