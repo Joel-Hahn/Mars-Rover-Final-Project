@@ -1,0 +1,10 @@
+# Big or regenerated files: share the crops, never the full DTM.
+data/dtm/
+data/raw/
+data/cache/
+
+# Python / pytest clutter
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
