@@ -26,6 +26,10 @@ Data provenance and limits
   the recorded trace; other map locations can still be optimized.
 * Fastest/lowest-energy routes use optimization.PathOptimizer and the
   direction-dependent TraversabilityModel.evaluate_move() costs (no charging).
+* An Energy graphs button opens total energy, cumulative energy vs distance,
+  and energy per meter plots. Graphs use the exact per-move costs computed by
+  traversability.py, not separate assumed numbers. The graph window supports
+  route selection, zoom/pan and saving a PNG via Matplotlib's toolbar.
 * NASA-route time and energy are MODEL ESTIMATES, computed by snapping the
   recorded polyline to the 2 m grid. These are NOT measured NASA telemetry.
   A recorded path can cross terrain the conservative model rejects, in which
@@ -97,6 +101,36 @@ class RoverPoint:
 
 
 @dataclass(frozen=True)
+class EnergySample:
+    """One directional tile move's modeled energy and cumulative path distance.
+
+    The initial sample is (0, 0, 0, 0). Energy is Joules; distance is
+    meters. Plotting converts Joules to watt-hours and never recalculates
+    movement costs independently from traversability.py.
+    """
+
+    distance_m: float
+    cumulative_energy_j: float
+    move_energy_j: float
+    move_distance_m: float
+
+
+def profile_from_moves(moves: Sequence) -> tuple[EnergySample, ...]:
+    """Build an energy trace directly from traversability/optimizer moves."""
+    samples = [EnergySample(0.0, 0.0, 0.0, 0.0)]
+    distance = energy = 0.0
+    for move in moves:
+        d, e = float(move.distance_m), float(move.energy_j)
+        if (not math.isfinite(d) or not math.isfinite(e) or
+                d <= 0 or e < 0 or not getattr(move, "passable", True)):
+            return ()  # no valid per-move energy data; never fabricate it
+        distance += d
+        energy += e
+        samples.append(EnergySample(distance, energy, e, d))
+    return tuple(samples)
+
+
+@dataclass(frozen=True)
 class RouteDisplay:
     name: str
     coordinates: tuple[XY, ...]
@@ -106,6 +140,7 @@ class RouteDisplay:
     note: str
     ascent_m: float | None = None
     descent_m: float | None = None
+    energy_profile: tuple[EnergySample, ...] = ()
 
     @property
     def energy_wh(self) -> float | None:
@@ -339,16 +374,34 @@ def route_cells_near_recorded_line(terrain, xy_line: Sequence[XY]) -> list[tuple
     return out
 
 
-def evaluate_recorded_path(model, terrain, xy_line: Sequence[XY]) -> tuple[float | None, float | None, str]:
-    """Model time and energy along NASA geometry; unavailable if blocked."""
+def evaluate_recorded_path_with_profile(
+    model, terrain, xy_line: Sequence[XY]
+) -> tuple[float | None, float | None, str, tuple[EnergySample, ...]]:
+    """Model time, energy and graph data for NASA geometry if safely modelable.
+
+    A modeled NASA energy profile is NOT telemetry. The display path remains
+    recorded geometry; its modeled graph distances follow snapped 2 m moves.
+    """
     try:
         cells = route_cells_near_recorded_line(terrain, xy_line)
         result = model.evaluate_path(cells)
         if not result.passable:
-            return None, None, "Model rejects at least one recorded-track tile/transition; estimates unavailable."
-        return result.time_s, result.energy_j, "Modeled from NASA track snapped to 2 m cells (NOT measured)."
+            return (None, None,
+                    "Model rejects at least one recorded-track tile/transition; estimates unavailable.", ())
+        profile = profile_from_moves(result.moves)
+        if not profile:
+            return None, None, "Invalid modeled movement costs along NASA track.", ()
+        return (result.time_s, result.energy_j,
+                "Modeled from NASA track snapped to 2 m cells (NOT measured).", profile)
     except (ValueError, IndexError) as exc:
-        return None, None, f"Model estimate unavailable: {exc}"
+        return None, None, f"Model estimate unavailable: {exc}", ()
+
+
+def evaluate_recorded_path(model, terrain, xy_line: Sequence[XY]) -> tuple[float | None, float | None, str]:
+    """Backward-compatible three-value summary for existing callers."""
+    time_s, energy_j, note, _profile = evaluate_recorded_path_with_profile(
+        model, terrain, xy_line)
+    return time_s, energy_j, note
 
 
 def cell_xy(terrain, cells: Sequence[tuple[int, int]]) -> tuple[XY, ...]:
@@ -393,13 +446,15 @@ def calculate_real_routes(terrain, track_xy: Sequence[XY], start: RoverPoint,
         recorded_length = cumulative_distances(actual)[-1]
         if recorded_length > 2500:
             t = e = None
+            energy_profile = ()
             actual_note = "Recorded path exceeds the local terrain model; modeled estimates unavailable."
         else:
-            t, e, actual_note = evaluate_recorded_path(model, terrain, actual)
+            t, e, actual_note, energy_profile = evaluate_recorded_path_with_profile(
+                model, terrain, actual)
         if start.along_m > end.along_m:
             actual_note = "Reverse of NASA recorded chronology. " + actual_note
         actual_result = RouteDisplay(ACTUAL, tuple(actual), recorded_length, t, e,
-                                     actual_note)
+                                     actual_note, energy_profile=energy_profile)
     else:
         actual_result = RouteDisplay(
             ACTUAL, (), None, None, None,
@@ -427,6 +482,7 @@ def calculate_real_routes(terrain, track_xy: Sequence[XY], start: RoverPoint,
                 route.time_s, route.energy_j,
                 "A* on 2 m tiles; no charging. " + snap_note,
                 route.ascent_m, route.descent_m,
+                profile_from_moves(route.moves),
             )
         else:
             result[name] = not_found(name, route.reason)
@@ -585,6 +641,11 @@ class MarsRoverUI(ttk.Frame):
         self.center_xy: XY = (0.0, 0.0)
         self.meters_per_pixel = 1.0
         self.routes: dict[str, RouteDisplay] = {}
+        self._energy_window: tk.Toplevel | None = None
+        self._energy_figure = None
+        self._energy_canvas = None
+        self._energy_visibility: dict[str, tk.BooleanVar] = {}
+        self._energy_checkboxes: dict[str, ttk.Checkbutton] = {}
         self._map_geometry = (1, 1)
         self._marker_pixels: dict[str, XY] = {}
         self._canvas_image = None
@@ -709,6 +770,9 @@ class MarsRoverUI(ttk.Frame):
                   foreground="#334155").pack(side="left")
         ttk.Checkbutton(bottom, text="2 m grid (close zoom)", variable=self.show_grid,
                         command=self._schedule_redraw).pack(side="left", padx=15)
+        self.energy_button = ttk.Button(bottom, text="Energy graphs",
+                                        command=self.open_energy_graphs, state="disabled")
+        self.energy_button.pack(side="left", padx=(0, 12))
         ttk.Label(bottom, textvariable=self.status_text,
                   foreground="#6d5947", wraplength=780).pack(side="right", padx=(10, 0))
 
@@ -749,6 +813,7 @@ class MarsRoverUI(ttk.Frame):
         self.active_dtm_path = None
         self.loading = self.calculating = False
         self.routes.clear()
+        self._refresh_energy_graphs()
         self.free_points.clear()
         self._card_positions.clear()
         self._image_cache_key = None
@@ -849,6 +914,7 @@ class MarsRoverUI(ttk.Frame):
             self._generation += 1
             self._map_generation += 1
             self.routes.clear()
+            self._refresh_energy_graphs()
             self._image_cache_key = None
             self._start_terrain_load(self.selected_dtm)
             self._schedule_redraw()
@@ -917,10 +983,12 @@ class MarsRoverUI(ttk.Frame):
                     self.calculating = False
                     self.routes, self.grid_terrain = payload
                     self.status_text.set("Routes calculated. Times and energy are modeled, not NASA telemetry.")
+                    self._refresh_energy_graphs()
                 elif kind == "routes_error":
                     self.calculating = False
                     self.routes.clear()
                     self.status_text.set(f"Route calculation failed: {payload}")
+                    self._refresh_energy_graphs()
                 self._update_button()
                 self._schedule_redraw()
         except queue.Empty:
@@ -953,12 +1021,16 @@ class MarsRoverUI(ttk.Frame):
         self.calculate_button.configure(
             state="normal" if valid and self.terrain is not None
             and not self.loading and not self.calculating else "disabled")
+        self.energy_button.configure(
+            state="normal" if any(route.energy_profile and route.energy_j is not None
+                                  for route in self.routes.values()) else "disabled")
 
     def _selection_changed(self) -> None:
         if self.calculating:
             self._generation += 1  # invalidate in-progress route work
         self.calculating = False
         self.routes.clear()
+        self._refresh_energy_graphs()
         a, b = self._selected_points()
         if a is None and self.end_name.get():
             self.end_name.set("")
@@ -1062,6 +1134,7 @@ class MarsRoverUI(ttk.Frame):
         case = self.case
         track_segments = tuple(tuple(seg) for seg in self.track_segments_xy)
         self.routes.clear()
+        self._refresh_energy_graphs()
         self.calculating = True
         self._update_button()
         self.status_text.set(f"Calculating routes for {distance:.1f} m separation...")
@@ -1104,7 +1177,8 @@ class MarsRoverUI(ttk.Frame):
                                    for point in route.coordinates)
                         rendered[name] = RouteDisplay(name, xy, route.distance_m,
                                                       route.time_s, route.energy_j,
-                                                      route.note, route.ascent_m, route.descent_m)
+                                                      route.note, route.ascent_m, route.descent_m,
+                                                      route.energy_profile)
                 else:
                     selected_track = (
                         track_segments[start.segment_id]
@@ -1474,6 +1548,144 @@ class MarsRoverUI(ttk.Frame):
     def _toggle_route(self, name: str) -> None:
         self.show_route[name].set(not self.show_route[name].get())
         self._schedule_redraw()
+
+    def open_energy_graphs(self) -> None:
+        """Show energy comparisons without shrinking or obscuring the map canvas.
+
+        These plots reuse the existing cost model's directional moves and are
+        created lazily, so the UI still loads if Matplotlib is not installed.
+        """
+        if not any(r.energy_profile and r.energy_j is not None
+                   for r in self.routes.values()):
+            messagebox.showinfo("Energy graphs", "Calculate routes with valid energy estimates first.")
+            return
+        if self._energy_window is not None and self._energy_window.winfo_exists():
+            self._energy_window.lift()
+            self._energy_window.focus_set()
+            return
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        except ImportError:
+            messagebox.showerror("Matplotlib required",
+                                 "Install Matplotlib in your VS Code environment:\n"
+                                 "python -m pip install matplotlib")
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Perseverance | Modeled route energy comparison")
+        window.geometry("1320x660")
+        window.minsize(950, 480)
+        self._energy_window = window
+        panel = ttk.Frame(window, padding=(12, 10))
+        panel.pack(fill="both", expand=True)
+        top = ttk.Frame(panel)
+        top.pack(fill="x", pady=(0, 6))
+        ttk.Label(top, text="ENERGY COMPARISON", font=("Segoe UI", 15, "bold")).pack(side="left")
+        ttk.Label(top, text="Show routes:", padding=(20, 0, 5, 0)).pack(side="left")
+        self._energy_visibility = {}
+        self._energy_checkboxes = {}
+        for name in ROUTE_NAMES:
+            route = self.routes.get(name)
+            var = tk.BooleanVar(master=window, value=self.show_route[name].get())
+            self._energy_visibility[name] = var
+            cb = ttk.Checkbutton(top, text=name, variable=var,
+                                 command=self._refresh_energy_graphs)
+            cb.pack(side="left", padx=(4, 6))
+            self._energy_checkboxes[name] = cb
+            if route is None or not route.energy_profile:
+                cb.configure(state="disabled")
+        ttk.Button(top, text="Close", command=window.destroy).pack(side="right")
+
+        fig = Figure(figsize=(13, 5.3), dpi=96, facecolor="#ffffff")
+        self._energy_figure = fig
+        self._energy_canvas = FigureCanvasTkAgg(fig, master=panel)
+        self._energy_canvas.get_tk_widget().pack(fill="both", expand=True)
+        toolbar = NavigationToolbar2Tk(self._energy_canvas, panel, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(fill="x", side="bottom")
+        ttk.Label(panel,
+                  text=("All energy estimates use the traversability model (no charging). "
+                        "NASA-track energy is modeled from 2 m grid moves, NOT measured telemetry. "
+                        "Checkboxes affect this graph window only. Use the chart toolbar to save images."),
+                  wraplength=1200, foreground="#64748b").pack(side="bottom", fill="x", pady=(6, 2))
+
+        def clear_window_refs(event) -> None:
+            if event.widget is window:
+                self._energy_window = None
+                self._energy_figure = None
+                self._energy_canvas = None
+                self._energy_visibility = {}
+                self._energy_checkboxes = {}
+        window.bind("<Destroy>", clear_window_refs, add="+")
+        self._refresh_energy_graphs()
+
+    def _refresh_energy_graphs(self) -> None:
+        """Refresh all plots on the Tk main thread after new route results."""
+        if (self._energy_window is None or not self._energy_window.winfo_exists()
+                or self._energy_figure is None or self._energy_canvas is None):
+            return
+        for name, cb in self._energy_checkboxes.items():
+            route = self.routes.get(name)
+            cb.configure(state="normal" if route is not None and route.energy_profile
+                         and route.energy_j is not None else "disabled")
+        fig = self._energy_figure
+        fig.clear()
+        ax_total, ax_cumulative, ax_intensity = fig.subplots(1, 3)
+        available = [name for name in ROUTE_NAMES
+                     if (self._energy_visibility.get(name) is not None
+                         and self._energy_visibility[name].get()
+                         and name in self.routes
+                         and self.routes[name].energy_j is not None
+                         and self.routes[name].energy_profile)]
+        if not available:
+            for ax in (ax_total, ax_cumulative, ax_intensity):
+                ax.text(.5, .5, "No energy data selected.\nCalculate routes or enable a route.",
+                        ha="center", va="center", transform=ax.transAxes,
+                        fontsize=11, color="#64748b")
+                ax.set_axis_off()
+        else:
+            for index, name in enumerate(available):
+                route = self.routes[name]
+                color = ROUTE_STYLES[name][0]
+                samples = route.energy_profile
+                xs = [s.distance_m for s in samples]
+                cumulative_wh = [s.cumulative_energy_j / 3600.0 for s in samples]
+                totals_wh = route.energy_j / 3600.0
+                ax_total.bar(index, totals_wh, color=color, width=.58)
+                ax_total.text(index, totals_wh, f"{totals_wh:.2f}",
+                              ha="center", va="bottom", fontsize=9)
+                ax_cumulative.plot(xs, cumulative_wh, color=color, linewidth=2,
+                                   label=name)
+                step_points = [(s.distance_m, s.move_energy_j / 3600.0 / s.move_distance_m)
+                               for s in samples[1:] if s.move_distance_m > 0]
+                if step_points:
+                    step_x, intensity = zip(*step_points)
+                    ax_intensity.plot(step_x, intensity, color=color, linewidth=1.4,
+                                      alpha=.85, label=name)
+            ax_total.set_xticks(list(range(len(available))),
+                                [name.replace(" path", "") for name in available],
+                                rotation=18, ha="right")
+            ax_total.set_ylabel("Energy (Wh)")
+            ax_total.set_title("Total modeled energy")
+            ax_total.set_ylim(bottom=0)
+            ax_total.margins(y=.18)
+            ax_cumulative.set_title("Cumulative energy vs. distance")
+            ax_cumulative.set_xlabel("Traveled distance (m)")
+            ax_cumulative.set_ylabel("Cumulative energy (Wh)")
+            ax_intensity.set_title("Energy required per meter")
+            ax_intensity.set_xlabel("Traveled distance (m)")
+            ax_intensity.set_ylabel("Energy intensity (Wh/m)")
+            for ax in (ax_cumulative, ax_intensity):
+                ax.set_xlim(left=0)
+                ax.set_ylim(bottom=0)
+                ax.legend(loc="best", fontsize=8)
+        for ax in (ax_total, ax_cumulative, ax_intensity):
+            if ax.axison:
+                ax.grid(alpha=.22, axis="y")
+                ax.set_axisbelow(True)
+        fig.subplots_adjust(left=.06, right=.985, bottom=.18, top=.88, wspace=.35)
+        self._energy_canvas.draw_idle()
 
     def _draw_route_cards(self) -> None:
         if not self.routes:
